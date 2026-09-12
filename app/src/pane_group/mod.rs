@@ -4419,6 +4419,7 @@ impl PaneGroup {
 
         let in_split_pane = self.panes.visible_pane_count() > 1;
         self.focus_state.update(ctx, |focus_state, ctx| {
+            focus_state.remove_pane_input_source(*pane_id);
             focus_state.set_in_split_pane(in_split_pane, ctx);
             // If the focused+maximized pane was removed, stop maximizing panes.
             if was_focused {
@@ -4921,6 +4922,9 @@ impl PaneGroup {
             );
 
             self.pane_contents.remove(&pane_id);
+            self.focus_state.update(ctx, |focus_state, _| {
+                focus_state.remove_pane_input_source(pane_id);
+            });
 
             // We should only remove the session id from the tree after we queried
             // and got the previous session id.
@@ -5629,6 +5633,9 @@ impl PaneGroup {
             log::warn!("Attempted to cleanup pane {pane_id} but it was not found in the tree");
         }
         self.pane_contents.remove(&pane_id);
+        self.focus_state.update(ctx, |focus_state, _| {
+            focus_state.remove_pane_input_source(pane_id);
+        });
         // Drop any transitive-share tracking entry for this pane so the
         // map doesn't accumulate stale ids.
         self.forget_transitively_shared_pane(pane_id);

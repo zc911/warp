@@ -1,7 +1,38 @@
+use std::collections::HashMap;
+
+#[cfg(target_os = "macos")]
+use warpui::platform::mac::Window;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle};
 
 use super::pane::{PaneId, TerminalPaneId};
 use super::{PaneState, SplitPaneState};
+
+#[derive(Debug, Default)]
+struct PaneInputSourceState {
+    by_pane: HashMap<PaneId, String>,
+}
+
+impl PaneInputSourceState {
+    fn with_initial_source(pane_id: PaneId, source_id: Option<String>) -> Self {
+        let mut state = Self::default();
+        if let Some(source_id) = source_id {
+            state.set(pane_id, source_id);
+        }
+        state
+    }
+
+    fn get(&self, pane_id: PaneId) -> Option<&str> {
+        self.by_pane.get(&pane_id).map(String::as_str)
+    }
+
+    fn set(&mut self, pane_id: PaneId, source_id: String) {
+        self.by_pane.insert(pane_id, source_id);
+    }
+
+    fn remove(&mut self, pane_id: PaneId) -> bool {
+        self.by_pane.remove(&pane_id).is_some()
+    }
+}
 
 /// Centralized focus state for a pane group.
 /// This model tracks which pane is focused, which session is active,
@@ -12,6 +43,8 @@ pub struct PaneGroupFocusState {
     active_session_id: Option<TerminalPaneId>,
     in_split_pane: bool,
     is_focused_pane_maximized: bool,
+    /// Per-pane keyboard input source IDs on macOS.
+    pane_input_sources: PaneInputSourceState,
 }
 
 #[derive(Debug, Clone)]
@@ -38,11 +71,20 @@ impl PaneGroupFocusState {
         active_session_id: Option<TerminalPaneId>,
         in_split_pane: bool,
     ) -> Self {
+        #[cfg(target_os = "macos")]
+        let initial_input_source = Window::get_current_input_source_id();
+        #[cfg(not(target_os = "macos"))]
+        let initial_input_source = None;
+
         Self {
             focused_pane_id,
             active_session_id,
             in_split_pane,
             is_focused_pane_maximized: false,
+            pane_input_sources: PaneInputSourceState::with_initial_source(
+                focused_pane_id,
+                initial_input_source,
+            ),
         }
     }
 
@@ -93,6 +135,9 @@ impl PaneGroupFocusState {
     pub(super) fn set_focused_pane(&mut self, pane_id: PaneId, ctx: &mut ModelContext<Self>) {
         let old_focused = self.focused_pane_id;
         if old_focused != pane_id {
+            self.save_input_source_for_pane(old_focused);
+            self.restore_input_source_for_pane(pane_id);
+
             self.focused_pane_id = pane_id;
             // When focus changes, clear maximize state
             self.is_focused_pane_maximized = false;
@@ -101,6 +146,35 @@ impl PaneGroupFocusState {
                 new_focused: pane_id,
             });
         }
+    }
+
+    /// Saves the current system input source ID for the given pane.
+    /// On macOS, this is a no-op when called from a background thread.
+    #[cfg(target_os = "macos")]
+    fn save_input_source_for_pane(&mut self, pane_id: PaneId) {
+        if let Some(source_id) = Window::get_current_input_source_id() {
+            self.pane_input_sources.set(pane_id, source_id);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn save_input_source_for_pane(&mut self, _pane_id: PaneId) {}
+
+    /// Restores the previously saved input source for the given pane.
+    /// New panes without a saved source inherit the current system input source.
+    #[cfg(target_os = "macos")]
+    fn restore_input_source_for_pane(&mut self, pane_id: PaneId) {
+        if let Some(source_id) = self.pane_input_sources.get(pane_id) {
+            Window::select_input_source(source_id);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn restore_input_source_for_pane(&mut self, _pane_id: PaneId) {}
+
+    /// Drops the saved input source for a pane that no longer exists.
+    pub(super) fn remove_pane_input_source(&mut self, pane_id: PaneId) {
+        self.pane_input_sources.remove(pane_id);
     }
 
     /// Sets the active terminal session and emits an ActiveSessionChanged event.
@@ -234,5 +308,52 @@ impl PaneFocusHandle {
             PaneGroupFocusEvent::InSplitPaneChanged => true,
             PaneGroupFocusEvent::FocusedPaneMaximizedChanged => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_input_source_is_recorded() {
+        let pane_id = PaneId::dummy_pane_id();
+        let state = PaneInputSourceState::with_initial_source(
+            pane_id,
+            Some("com.apple.keylayout.ABC".to_string()),
+        );
+
+        assert_eq!(state.get(pane_id), Some("com.apple.keylayout.ABC"));
+    }
+
+    #[test]
+    fn missing_initial_input_source_is_a_noop() {
+        let pane_id = PaneId::dummy_pane_id();
+        let state = PaneInputSourceState::with_initial_source(pane_id, None);
+
+        assert_eq!(state.get(pane_id), None);
+    }
+
+    #[test]
+    fn saved_input_source_can_be_restored() {
+        let pane_id = PaneId::dummy_pane_id();
+        let mut state = PaneInputSourceState::default();
+
+        state.set(pane_id, "com.apple.inputmethod.SCIM.ITABC".to_string());
+
+        assert_eq!(state.get(pane_id), Some("com.apple.inputmethod.SCIM.ITABC"));
+    }
+
+    #[test]
+    fn removing_a_pane_clears_its_input_source() {
+        let pane_id = PaneId::dummy_pane_id();
+        let mut state = PaneInputSourceState::with_initial_source(
+            pane_id,
+            Some("com.apple.keylayout.ABC".to_string()),
+        );
+
+        assert!(state.remove(pane_id));
+        assert_eq!(state.get(pane_id), None);
+        assert!(!state.remove(pane_id));
     }
 }
